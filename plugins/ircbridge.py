@@ -6,6 +6,7 @@ from multiprocessing import Process, Pipe
 
 import irc.client
 import urlparse
+import logging
 
 
 STORAGE_KEY = 'irc_config'
@@ -24,11 +25,25 @@ class IrcPlugin(WillPlugin):
         self.irc_process = Process(target=self.irc_thread, args=(child_pipe,))
         self.irc_process.start()
 
-    @hear(r"^(?P<text>.+)$")
+    @hear(r"^(?P<text>.+)$", multiline=True)
     def on_message(self, message, text=None):
         room_name = self.get_room_from_message(message)["name"]
-        self.pipe.send_bytes(
-            COMMAND_MESSAGE + '|' + room_name + ';' + format_message(sender=message.sender.nick, body=text)
+        if '\n' in text:
+            self.say('Unable to send multiline messages to IRC', message=message, color='red')
+            return
+
+        self.send_command_irc_process(
+            COMMAND_MESSAGE, room_name, format_message(sender=message.sender.nick, body=text)
+        )
+
+    def send_command_irc_process(self, command, room_name, argument=None):
+        self.pipe.send_bytes(self.string_encode_message(command, room_name, argument))
+
+    def string_encode_message(self, command, room_name, argument=None):
+        return '{cmd}|{room_name};{arg}'.format(
+            cmd=command,
+            room_name=room_name,
+            arg=(argument or '')
         )
 
     @respond_to(r"^[cC]onnect to irc channel (?P<url>.+)")
@@ -46,7 +61,10 @@ class IrcPlugin(WillPlugin):
 
         configuration[room_name] = url
         self.save(STORAGE_KEY, configuration)
-        self.pipe.send_bytes(COMMAND_CONNECT + '|' + room_name + ';' + url)
+
+        self.send_command_irc_process(
+            COMMAND_CONNECT, room_name, url
+        )
 
     @respond_to(r"^[dD]isconnect from irc")
     def disconnect_from_channel(self, message):
@@ -55,7 +73,10 @@ class IrcPlugin(WillPlugin):
         if room_name in configuration:
             del configuration[room_name]
             self.save(STORAGE_KEY, configuration)
-            self.pipe.send_bytes(COMMAND_DISCONNECT + '|' + room_name)
+
+            self.send_command_irc_process(
+                COMMAND_DISCONNECT, room_name
+            )
 
     def irc_thread(self, pipe):
         configuration = self.load(STORAGE_KEY, {})
@@ -66,21 +87,33 @@ class IrcPlugin(WillPlugin):
             self.send_connection_notification(connection)
 
         while True:
-            bot.reactor.process_once(timeout=REACTOR_LOOP_TIMEOUT)
-            if pipe.poll():
-                message = pipe.recv_bytes()
-                command, payload = message.split('|', 1)
-                if command == COMMAND_CONNECT:
-                    room_name, url = payload.split(';', 1)
-                    connection = bot.connect_to_url(room_name, url)
-                    self.send_connection_notification(connection)
-                elif command == COMMAND_MESSAGE:
-                    room_name, message_text = payload.split(';', 1)
-                    bot.send_public_message(room_name, message_text)
-                elif command == COMMAND_DISCONNECT:
-                    bot.disconnect(payload)
-                    room = self.get_room_from_name_or_id(payload)
-                    self.say("Disconnected from IRC", room=room)
+            try:
+                bot.reactor.process_once(timeout=REACTOR_LOOP_TIMEOUT)
+                if pipe.poll():
+                    encoded_message = pipe.recv_bytes()
+                    command, room_name, argument = self.decode_string_message(encoded_message)
+                    if command == COMMAND_CONNECT:
+                        connection = bot.connect_to_url(room_name, argument)
+                        self.send_connection_notification(connection)
+                    elif command == COMMAND_MESSAGE:
+                        bot.send_public_message(room_name, argument)
+                    elif command == COMMAND_DISCONNECT:
+                        bot.disconnect(room_name)
+                        room = self.get_room_from_name_or_id(room_name)
+                        self.say("Disconnected from IRC", room=room)
+            except Exception:
+                logging.critical('Error managing IRC connection', exc_info=True)
+
+    def decode_string_message(self, encoded_message):
+        command, payload = encoded_message.split('|', 1)
+        split_payload = payload.split(';', 1)
+        room_name = split_payload[0]
+        if len(split_payload) > 1:
+            argument = split_payload[1]
+        else:
+            argument = None
+
+        return command, room_name, argument
 
     def send_to_hipchat_from_irc(self, connection, sender, message_text):
         room = self.get_room_from_name_or_id(connection.name)
@@ -146,13 +179,30 @@ class IrcBot(object):
                     handler(connection, event.source.nick, event.arguments[0])
                 except Exception as e:
                     print e
+        elif event.type == 'privmsg':
+            msg = event.arguments[0]
+            if not msg.startswith('!'):
+                return
+
+            command_handler = getattr(self, 'command_' + msg[1:], None)
+            if command_handler is not None:
+                command_handler(connection, event)
 
     def send_public_message(self, connection_name, message_text):
         connection = self.connections.get(connection_name)
         if connection:
             connection.privmsg(connection.channel, message_text)
 
+    def command_help(self, connection, event):
+        connection.privmsg(
+            event.source.nick,
+            'Available Commands - !status: show bot status information'
+            ', !help: show this message'
+        )
+
+    def command_status(self, connection, event):
+        connection.privmsg(event.source.nick, "Connected to {room_name}".format(room_name=connection.name))
 
 def format_message(sender, body):
-    message_format = getattr(settings, 'IRC_MESSAGE_TEMPLATE', "({sender}) {body}")
+    message_format = getattr(settings, 'IRC_MESSAGE_TEMPLATE', "[{sender}] {body}")
     return message_format.format(sender=sender, body=body)
